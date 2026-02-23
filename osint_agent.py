@@ -8,6 +8,19 @@ import pyarrow as pa
 from openai import OpenAI
 from rich.console import Console
 from rich.markdown import Markdown
+from elasticsearch import Elasticsearch
+
+# Initialize Elasticsearch
+try:
+    # Adding more robust initialization
+    es = Elasticsearch(
+        "http://localhost:9200",
+        request_timeout=30,
+        max_retries=3,
+        retry_on_timeout=True
+    )
+except Exception:
+    es = None
 
 # Initialize LanceDB connection and ensure table exists
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lancedb_data")
@@ -41,6 +54,7 @@ client = OpenAI(
 
 # Set the model to the requested gpt-oss model
 MODEL = "gpt-oss:20b"
+SECURE_MODE = False
 
 # Define the shell execution tool
 tools = [
@@ -98,11 +112,90 @@ tools = [
                 "required": ["query"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_searxng",
+            "description": "Perform an aggregated web search using SearXNG. Good for general querying across multiple engines anonymously.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The web search query."
+                    }
+                },
+                "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_yacy",
+            "description": "Perform a search using YaCy peer-to-peer decentralized search engine. Good for uncensored info and local network traversal.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The search query."
+                    }
+                },
+                "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_elasticsearch",
+            "description": "Search ElasticSearch for highly structured OSINT data you have previously aggregated.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "index": {
+                        "type": "string",
+                        "description": "The index name to search."
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "The search query."
+                    }
+                },
+                "required": ["index", "query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "store_in_elasticsearch",
+            "description": "Store highly structured OSINT findings in ElasticSearch for advanced querying capabilities later.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "index": {
+                        "type": "string",
+                        "description": "The index name to insert into."
+                    },
+                    "data": {
+                        "type": "string",
+                        "description": "The JSON formatted string representing the document to store."
+                    }
+                },
+                "required": ["index", "data"]
+            }
+        }
     }
 ]
 
 def execute_shell_command(command: str) -> str:
     """Executes a shell command and returns its output or error."""
+    global SECURE_MODE
+    if SECURE_MODE:
+        command = f"proxychains4 -q {command}"
     console.print(f"[bold yellow]Executing command:[/bold yellow] {command}")
     try:
         # Run the command with a timeout to prevent hanging
@@ -162,6 +255,96 @@ def search_database(query: str) -> str:
     except Exception as e:
         return f"Error searching database: {str(e)}"
 
+def search_searxng(query: str) -> str:
+    """Searches the web via local SearXNG."""
+    console.print(f"[bold green]SearXNG Search:[/bold green] {query}")
+    try:
+        response = requests.get(f"http://localhost:8080/search", params={"q": query, "format": "json"})
+        if response.status_code == 200:
+            results = response.json().get("results", [])
+            if not results:
+                return "No results found on SearXNG."
+            formatted = []
+            for r in results[:5]:  # limit to top 5
+                formatted.append(f"Title: {r.get('title')}\nURL: {r.get('url')}\nContent: {r.get('content')}")
+            return "\n\n---\n\n".join(formatted)
+        return f"SearXNG error: status {response.status_code}"
+    except Exception as e:
+        return f"Error searching SearXNG: {str(e)}"
+
+def search_yacy(query: str) -> str:
+    """Searches YaCy P2P network."""
+    console.print(f"[bold green]YaCy Search:[/bold green] {query}")
+    try:
+        response = requests.get(f"http://localhost:8090/yacysearch.json", params={"query": query})
+        if response.status_code == 200:
+            channels = response.json().get("channels", [])
+            if not channels or not channels[0].get("items"):
+                return "No results found on YaCy."
+            formatted = []
+            for r in channels[0].get("items", [])[:5]:
+                formatted.append(f"Title: {r.get('title')}\nURL: {r.get('link')}\nContent: {r.get('description')}")
+            return "\n\n---\n\n".join(formatted)
+        return f"YaCy error: status {response.status_code}"
+    except Exception as e:
+        return f"Error searching YaCy: {str(e)}"
+
+def store_in_elasticsearch(index: str, data: str) -> str:
+    """Store document in ElasticSearch."""
+    console.print(f"[bold green]Storing in ES ({index}):[/bold green]")
+    try:
+        if es is None:
+            return "ElasticSearch is not connected."
+        # try to parse data string as json dict
+        doc = json.loads(data)
+        
+        # Explicitly checking for version compatibility or using a more direct index call
+        # Some newer clients (v9) might send headers that ES 8.x doesn't like without strict tuning.
+        try:
+            res = es.index(index=index, document=doc)
+            return f"Successfully stored document in ElasticSearch index '{index}'. ID: {res.get('_id')}"
+        except Exception as inner_e:
+            if "media_type_header_exception" in str(inner_e):
+                # Fallback: try raw request if library has header issues
+                url = f"http://localhost:9200/{index}/_doc"
+                headers = {"Content-Type": "application/json"}
+                resp = requests.post(url, json=doc, headers=headers)
+                if resp.status_code in (200, 201):
+                    return f"Successfully stored document via fallback requests to '{index}'."
+                raise Exception(f"Fallback also failed: {resp.text}")
+            raise inner_e
+
+    except json.JSONDecodeError:
+        return "Error: Data must be a valid JSON string."
+    except Exception as e:
+        return f"Error storing in ElasticSearch: {str(e)}"
+
+def search_elasticsearch(index: str, query: str) -> str:
+    """Search document in ElasticSearch."""
+    console.print(f"[bold green]Searching ES ({index}):[/bold green] {query}")
+    try:
+        if es is None:
+            return "ElasticSearch is not connected."
+        # simple multi-match query
+        body = {
+            "query": {
+                "multi_match": {
+                    "query": query,
+                    "fields": ["*"]
+                }
+            }
+        }
+        res = es.search(index=index, body=body, size=3)
+        hits = res['hits']['hits']
+        if not hits:
+            return "No results found in ElasticSearch."
+        formatted = []
+        for h in hits:
+            formatted.append(json.dumps(h['_source'], indent=2))
+        return "\n\n---\n\n".join(formatted)
+    except Exception as e:
+        return f"Error searching ElasticSearch: {str(e)}"
+
 def run_agent_loop(initial_prompt: str = None):
     # System prompt sets the persona and rules for the agent
     messages = [
@@ -169,7 +352,7 @@ def run_agent_loop(initial_prompt: str = None):
             "role": "system",
             "content": (
                 "You are an expert, automated OSINT (Open Source Intelligence) agent running on a Nyarch Linux system. "
-                "You have access to a shell tool that allows you to execute commands, and LanceDB database tools to store and search information. "
+                "You have access to a shell tool that allows you to execute commands, LanceDB tools for semantic storage, SearXNG for web search, YaCy for P2P search, and ElasticSearch for structured OSINT database logic. "
                 "The system has 'social' and 'recon' OSINT packages installed (e.g., tools like sherlock, holehe, theHarvester, nmap, etc.). "
                 "When given a target or request, formulate a plan to gather information using the available CLI tools. "
                 "Do not guess information; execute commands to find out. Store useful findings in the database so you don't forget them. "
@@ -255,6 +438,60 @@ def run_agent_loop(initial_prompt: str = None):
                             "name": tool_call.function.name,
                             "content": function_response
                         })
+                        
+                    elif tool_call.function.name == "search_searxng":
+                        function_args = json.loads(tool_call.function.arguments)
+                        query = function_args.get("query")
+                        
+                        function_response = search_searxng(query)
+                        
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "name": tool_call.function.name,
+                            "content": function_response
+                        })
+                        
+                    elif tool_call.function.name == "search_yacy":
+                        function_args = json.loads(tool_call.function.arguments)
+                        query = function_args.get("query")
+                        
+                        function_response = search_yacy(query)
+                        
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "name": tool_call.function.name,
+                            "content": function_response
+                        })
+                        
+                    elif tool_call.function.name == "search_elasticsearch":
+                        function_args = json.loads(tool_call.function.arguments)
+                        index = function_args.get("index")
+                        query = function_args.get("query")
+                        
+                        function_response = search_elasticsearch(index, query)
+                        
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "name": tool_call.function.name,
+                            "content": function_response
+                        })
+                        
+                    elif tool_call.function.name == "store_in_elasticsearch":
+                        function_args = json.loads(tool_call.function.arguments)
+                        index = function_args.get("index")
+                        data = function_args.get("data")
+                        
+                        function_response = store_in_elasticsearch(index, data)
+                        
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "name": tool_call.function.name,
+                            "content": function_response
+                        })
                 # The loop will continue, passing the tool results back to the model
                 continue
             
@@ -271,5 +508,10 @@ def run_agent_loop(initial_prompt: str = None):
             messages.pop() # Remove the last user message so they can try again
 
 if __name__ == "__main__":
-    initial_request = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else None
+    args = sys.argv[1:]
+    if "-s" in args or "-secure" in args:
+        SECURE_MODE = True
+        args = [a for a in args if a not in ("-s", "-secure")]
+    
+    initial_request = " ".join(args) if args else None
     run_agent_loop(initial_request)
