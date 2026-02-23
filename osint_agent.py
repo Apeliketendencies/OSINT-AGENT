@@ -11,6 +11,7 @@ from rich.markdown import Markdown
 from elasticsearch import Elasticsearch
 from bs4 import BeautifulSoup
 import re
+import nltk
 
 # Initialize Elasticsearch
 try:
@@ -369,8 +370,10 @@ def analyze_image(image_path: str) -> str:
     else:
         results.append(f"Skipping EXIF: {image_path} is an external URL or not found locally.")
 
-    # 2. Facial APIs (Stubbed as user requested/approved fallback processing)
-    results.append("FaceCheck.ID / PimEyes Search: [STUBBED - API KEY REQUIRED] - AI Model instructed to proceed with linguistic or infrastructure correlations instead if face search is unavailable.")
+    # 2. Facial APIs (EagleEye from BlackArch)
+    cmd = f'proxychains4 -q eagleeye --image "{image_path}" || proxychains4 -q EagleEye --image "{image_path}" || echo "EagleEye execution failed or not found."'
+    ee_out = execute_shell_command(cmd)
+    results.append(f"EagleEye Facial Profile Search:\n{ee_out}")
     
     # 3. Synthetic Screening (GAN check)
     results.append("Deepfake/GAN Likelihood: Analyzing artifacts... Probability of Synthetic Generation: Low (0.05)")
@@ -378,19 +381,44 @@ def analyze_image(image_path: str) -> str:
     return "\n---\n".join(results)
 
 def analyze_stylometry(text_a: str, text_b: str) -> str:
-    """Prompt the underlying local LLM to perform stylometry comparison."""
+    """Perform stylometry comparison using NLTK."""
     console.print("[bold blue]Behavioral Fingerprinting (Stylometry)[/bold blue]")
     
-    # We construct an internal prompt to process stylometry
-    prompt = f"Analyze the following two texts for linguistic stylometry (word frequency, punctuation, capitalization, common slang). Determine the probability (0-100%) they were written by the same author.\nText A: '{text_a}'\nText B: '{text_b}'\nProvide a very short analysis and probability score."
-    
     try:
-        response = client.chat.completions.create(
-            model=MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.1
-        )
-        return response.choices[0].message.content
+        from nltk.tokenize import word_tokenize
+        from collections import Counter
+        
+        # Ensure punkt is available
+        try:
+            nltk.data.find('tokenizers/punkt')
+            nltk.data.find('tokenizers/punkt_tab')
+        except LookupError:
+            nltk.download('punkt', quiet=True)
+            nltk.download('punkt_tab', quiet=True)
+
+        def get_stats(text):
+            tokens = word_tokenize(text.lower())
+            words = [t for t in tokens if t.isalnum()]
+            if not words: return 0.0, 0.0, {}
+            ttr = len(set(words)) / len(words) # Type-Token Ratio
+            avg_len = sum(len(w) for w in words) / len(words)
+            freq = Counter(words)
+            return ttr, avg_len, freq
+            
+        ttr_a, len_a, _ = get_stats(text_a)
+        ttr_b, len_b, _ = get_stats(text_b)
+        
+        ttr_diff = abs(ttr_a - ttr_b)
+        len_diff = abs(len_a - len_b)
+        
+        # Base heuristic probability
+        prob = 100.0 - (ttr_diff * 100.0 * 0.5) - (len_diff * 10.0 * 0.5)
+        prob = max(0.0, min(100.0, prob))
+        
+        return (f"Stylometry Analysis using NLTK:\n"
+                f"Text A: TTR={ttr_a:.2f}, AvgWordLen={len_a:.2f}\n"
+                f"Text B: TTR={ttr_b:.2f}, AvgWordLen={len_b:.2f}\n"
+                f"Probability of Match (Heuristic): {prob:.1f}%")
     except Exception as e:
         return f"Stylometry Analysis Error: {str(e)}"
 

@@ -6,3 +6,4 @@ lancedb
 pyarrow
 requests
 elasticsearch<9.0.0
+nltk
