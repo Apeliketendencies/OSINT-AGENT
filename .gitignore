@@ -1,0 +1,21 @@
+# Vector DB
+lancedb_data/
+
+# Virtual Environment
+venv/
+.venv/
+env/
+
+# Python Cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Personal/Sensitive Data
+.env
+*.key
+*.token
+credentials.json
+
+# System files
+.DS_Store

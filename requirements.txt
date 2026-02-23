@@ -1,0 +1,7 @@
+openai
+rich
+numpy
+pandas
+lancedb
+pyarrow
+requests
